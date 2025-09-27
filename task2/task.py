@@ -98,7 +98,7 @@ def draw_translucent_panel(img, x, y, w, h, color=(0,0,0), alpha=0.4):
     cv.rectangle(overlay, (x, y), (x + w, y + h), color, -1)
     cv.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
 
-def draw_hud_bottom_left(img, lines):
+def draw_hud_bottom_left(img, lines, colors=None):
     max_text_w = 0
     text_h = 0
     for ln in lines:
@@ -111,8 +111,11 @@ def draw_hud_bottom_left(img, lines):
     y = img.shape[0] - 10 - panel_h
     draw_translucent_panel(img, x, y, panel_w, panel_h, color=(0,0,0), alpha=0.45)
     baseline_y = y + PANEL_PAD_Y + text_h
-    for ln in lines:
-        cv.putText(img, ln, (x + PANEL_PAD_X, baseline_y), FONT, FONT_SCALE, (255,255,255), FONT_THICK, cv.LINE_AA)
+    for i, ln in enumerate(lines):
+        col = (255,255,255)  # default white
+        if colors is not None and i < len(colors) and colors[i] is not None:
+            col = colors[i]
+        cv.putText(img, ln, (x + PANEL_PAD_X, baseline_y), FONT, FONT_SCALE, col, FONT_THICK, cv.LINE_AA)
         baseline_y += LINE_SPACING
 
 def detect():
@@ -218,48 +221,80 @@ def detect():
                           W_APPROACH * S_approach +
                           W_VEL * S_vel)
 
+                # compute bbox coords (xyxy) and keep xywh too
+                x1, y1 = int(x - w/2), int(y - h/2)
+                x2, y2 = int(x + w/2), int(y + h/2)
+                bbox_xywh = (float(x), float(y), float(w), float(h))
+
                 outputs.append({
                     "id": tid,
-                    "position_label": pos_label,
+                    "conf": float(s),
+                    "area": float(A),
+                    "Ahat": float(Ahat),
+                    "bbox": (x1, y1, x2, y2),        # xyxy ints for drawing
+                    "bbox_xywh": bbox_xywh,         # center x,y,w,h floats
                     "centroid": (cx, cy),
+                    "position_label": pos_label,
                     "status": status,
                     "size_index": size_idx,
                     "movement": move_label,
-                    "threat_score": round(threat, 3)
+                    "speed": float(speed),
+                    "S_size": float(S_size),
+                    "S_center": float(S_center),
+                    "S_approach": float(S_approach),
+                    "S_vel": float(S_vel),
+                    "threat_score": float(round(threat, 3))
                 })
 
-                # Minimal drawing (faster than plot):
-                x1, y1 = int(x - w/2), int(y - h/2)
-                x2, y2 = int(x + w/2), int(y + h/2)
-                cv.rectangle(annotated, (x1, y1), (x2, y2), (0,255,255), 2, cv.LINE_AA)
+                # small ID text (kept)
                 cv.putText(annotated, f"ID {tid} {size_idx}", (x1, max(20, y1-6)),
                            FONT, 0.6, (0,255,255), 2, cv.LINE_AA)
 
-            if outputs:
-                top_threat = max(outputs, key=lambda o: o["threat_score"])
-  
+            # Sort outputs by threat desc and assign rank (1 = highest)
+            outputs.sort(key=lambda o: o["threat_score"], reverse=True)
+            for idx, o in enumerate(outputs, start=1):
+                o["rank"] = idx
+            top_threat = outputs[0] if outputs else None
 
+            # draw boxes now that top_threat is known
+            if outputs:
+                top_id = top_threat["id"] if top_threat is not None else None
+                for o in outputs:
+                    bx1, by1, bx2, by2 = o["bbox"]
+                    color = (0,0,255) if o["id"] == top_id else (0,255,255)
+                    thickness = 3 if o["id"] == top_id else 2
+                    cv.rectangle(annotated, (bx1, by1), (bx2, by2), color, thickness, cv.LINE_AA)
+                    if o["id"] == top_id:
+                        cv.putText(annotated, f"TOP ID {o['id']}", (bx1, max(20, by1-26)),
+                                   FONT, 0.6, (0,0,255), 2, cv.LINE_AA)
+  
         # ---------- FPS / HUD ----------
         t2 = time.perf_counter()
         inst_fps = 1.0 / max(1e-6, (t2 - last_t))
         last_t = t2
         fps = (1 - alpha_fps) * fps + alpha_fps * inst_fps if fps > 0 else inst_fps
 
+        # Build a compact structured HUD: one line per detection summarizing key fields
         hud_lines = [f"FPS: {fps:5.1f}",
                      f"Times ms  det+track={(t1-t0)*1000:5.1f}  post={(t2-t1)*1000:5.1f}  loop={(t2-loop_t0)*1000:5.1f}"]
         if outputs:
+            hud_lines.append(f"Detections: {len(outputs)}  TopThreat: {top_threat['threat_score']:.3f}")
+            # Build colors list: header lines white
+            hud_colors = [(255,255,255), (255,255,255)]
+            # detection-count line white
+            hud_colors.append((255,255,255))
             for o in outputs:
-                hud_lines.append(f"ID {o['id']} | {o['position_label']} | C{tuple(o['centroid'])}")
-                hud_lines.append(f"  {o['status']} | {o['size_index']} | {o['movement']}")
-                hud_lines.append(f"  Threat: {o['threat_score']:.3f}")
-            if top_threat:
-                hud_lines.append("--- Highest Priority Threat ---")
-                hud_lines.append(f"Target ID {top_threat['id']} "
-                                 f"({top_threat['size_index']}, {top_threat['status']}, {top_threat['position_label']})")
+                hud_lines.append(
+                    f"R{o['rank']:d} ID{o['id']} thr={o['threat_score']:.3f} conf={o['conf']:.2f} "
+                    f"sz={o['size_index']} st={o['status']} pos={o['position_label']} C{tuple(o['centroid'])}"
+                )
+                # color top-ranked detection red, others white
+                hud_colors.append((0,0,255) if o.get("rank", 999) == 1 else (255,255,255))
         else:
             hud_lines.append("No balloons detected")
-
-        draw_hud_bottom_left(annotated, hud_lines)
+            hud_colors = [(255,255,255), (255,255,255)]
+        # pass colors to drawer
+        draw_hud_bottom_left(annotated, hud_lines, hud_colors)
 
         cv.imshow("YOLOv11 Detection", annotated)
         if (cv.waitKey(1) & 0xFF) == ord("q"):

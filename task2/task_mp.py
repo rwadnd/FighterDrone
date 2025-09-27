@@ -6,7 +6,7 @@ import math, time, sys, signal
 import numpy as np
 from collections import deque
 from multiprocessing import Process, Queue, Event, set_start_method
-
+import queue as pyqueue
 # -------------------- Tunables --------------------
 WIDTH, HEIGHT = 1280, 720
 IMGSZ = 640
@@ -44,7 +44,7 @@ def draw_translucent_panel(img, x, y, w, h, color=(0,0,0), alpha=0.45):
     cv.rectangle(overlay, (x, y), (x + w, y + h), color, -1)
     cv.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
 
-def draw_hud_bottom_left(img, lines):
+def draw_hud_bottom_left(img, lines, colors=None):
     max_text_w = 0; text_h = 0
     for ln in lines:
         (tw, th), _ = cv.getTextSize(ln, FONT, FONT_SCALE, FONT_THICK)
@@ -56,9 +56,12 @@ def draw_hud_bottom_left(img, lines):
     y = img.shape[0] - 10 - panel_h
     draw_translucent_panel(img, x, y, panel_w, panel_h)
     baseline_y = y + PANEL_PAD_Y + text_h
-    for ln in lines:
+    for i, ln in enumerate(lines):
+        col = (255,255,255)
+        if colors is not None and i < len(colors) and colors[i] is not None:
+            col = colors[i]
         cv.putText(img, ln, (x + PANEL_PAD_X, baseline_y), FONT, FONT_SCALE,
-                   (255,255,255), FONT_THICK, cv.LINE_AA)
+                   col, FONT_THICK, cv.LINE_AA)
         baseline_y += LINE_SPACING
 
 # -------------------- Capture Process --------------------
@@ -83,7 +86,18 @@ def capture_proc(frame_q: Queue, stop_ev: Event):
                 _ = frame_q.get_nowait()
             except Exception:
                 pass
-        frame_q.put(frame, block=False)
+        try:
+            frame_q.put_nowait(frame)
+        except pyqueue.Full:
+            try:
+                _ = frame_q.get_nowait()  # drop oldest
+            except pyqueue.Empty:
+                pass
+            # second attempt; if it still fails, just skip this frame
+            try:
+                frame_q.put_nowait(frame)
+            except pyqueue.Full:
+                pass
     cap.release()
 
 # -------------------- Inference Process --------------------
@@ -234,27 +248,54 @@ def inference_proc(frame_q: Queue, result_q: Queue, stop_ev: Event):
                           W_APPROACH * S_approach +
                           W_VEL * S_vel)
 
+                # compute bbox coords but defer rectangle drawing
+                x1, y1 = int(x - w/2), int(y - h/2)
+                x2, y2 = int(x + w/2), int(y + h/2)
+                bbox_xywh = (float(x), float(y), float(w), float(h))
+
                 outputs.append({
                     "id": tid,
-                    "position_label": pos_label,
+                    "conf": float(s),
+                    "area": float(A),
+                    "Ahat": float(Ahat),
+                    "bbox": (x1, y1, x2, y2),
+                    "bbox_xywh": bbox_xywh,
                     "centroid": (cx, cy),
+                    "position_label": pos_label,
                     "status": status,
                     "size_index": size_idx,
                     "movement": move_label,
-                    "threat_score": round(threat, 3)
+                    "speed": float(speed),
+                    "S_size": float(S_size),
+                    "S_center": float(S_center),
+                    "S_approach": float(S_approach),
+                    "S_vel": float(S_vel),
+                    "threat_score": float(round(threat, 3))
                 })
 
-                # Minimal drawing
-                x1, y1 = int(x - w/2), int(y - h/2)
-                x2, y2 = int(x + w/2), int(y + h/2)
-                cv.rectangle(annotated, (x1, y1), (x2, y2), (0,255,255), 2, cv.LINE_AA)
+                # keep compact label text (no rectangle) for readability
                 cv.putText(annotated, f"ID {tid} {size_idx}", (x1, max(20, y1-6)),
                            FONT, 0.6, (0,255,255), 2, cv.LINE_AA)
 
 
+            # Sort outputs by threat desc, assign rank and top_threat
+            outputs.sort(key=lambda o: o["threat_score"], reverse=True)
+            for idx, o in enumerate(outputs, start=1):
+                o["rank"] = idx
+            top_threat = outputs[0] if outputs else None
+
+            # draw boxes now that top_threat is known
             if outputs:
-                top_threat = max(outputs, key=lambda o: o["threat_score"])
-               
+                top_id = top_threat["id"] if top_threat is not None else None
+                for o in outputs:
+                    bx1, by1, bx2, by2 = o["bbox"]
+                    color = (0,0,255) if o["id"] == top_id else (0,255,255)
+                    thickness = 3 if o["id"] == top_id else 2
+                    cv.rectangle(annotated, (bx1, by1), (bx2, by2), color, thickness, cv.LINE_AA)
+                    if o["id"] == top_id:
+                        cv.putText(annotated, f"TOP ID {o['id']}", (bx1, max(20, by1-26)),
+                                   FONT, 0.6, (0,0,255), 2, cv.LINE_AA)
+
 
         t2 = time.perf_counter()
         det_ms = (t1 - t0) * 1000.0
@@ -268,7 +309,7 @@ def inference_proc(frame_q: Queue, result_q: Queue, stop_ev: Event):
         # Package result payload (lightweight metadata + jpg bytes)
         payload = {
             "jpg": jpg,                 # numpy 1D uint8
-            "outputs": outputs,         # list of dicts
+            "outputs": outputs,         # list of enriched dicts, sorted by threat (rank included)
             "top_threat": top_threat,   # dict or None
             "timings": {"det+track": det_ms, "post": post_ms}
         }
@@ -279,7 +320,17 @@ def inference_proc(frame_q: Queue, result_q: Queue, stop_ev: Event):
                 _ = result_q.get_nowait()
             except Exception:
                 pass
-        result_q.put(payload, block=False)
+        try:
+            result_q.put_nowait(payload)
+        except pyqueue.Full:
+            try:
+                _ = result_q.get_nowait()
+            except pyqueue.Empty:
+                pass
+            try:
+                result_q.put_nowait(payload)
+            except pyqueue.Full:
+                pass
 
     # Cleanup
     # (nothing else to release here)
@@ -344,24 +395,25 @@ def main():
         last_t = now
         fps = (1 - alpha_fps) * fps + alpha_fps * inst if fps > 0 else inst
 
-        # HUD
+        # HUD: compact structured lines per detection using new fields
         hud_lines = [
             f"FPS: {fps:5.1f}",
             f"Times ms  det+track={timings['det+track']:5.1f}  post={timings['post']:5.1f}"
         ]
         if outputs:
+            hud_lines.append(f"Detections: {len(outputs)}  TopThreat: {top_threat['threat_score']:.3f}")
+            hud_colors = [(255,255,255), (255,255,255)]
+            hud_colors.append((255,255,255))
             for o in outputs:
-                hud_lines.append(f"ID {o['id']} | {o['position_label']} | C{tuple(o['centroid'])}")
-                hud_lines.append(f"  {o['status']} | {o['size_index']} | {o['movement']}")
-                hud_lines.append(f"  Threat: {o['threat_score']:.3f}")
-            if top_threat:
-                hud_lines.append("--- Highest Priority Threat ---")
-                hud_lines.append(f"Target ID {top_threat['id']} "
-                                 f"({top_threat['size_index']}, {top_threat['status']}, {top_threat['position_label']})")
+                hud_lines.append(
+                    f"R{o['rank']:d} ID{o['id']} thr={o['threat_score']:.3f} conf={o['conf']:.2f} "
+                    f"sz={o['size_index']} st={o['status']} pos={o['position_label']} C{tuple(o['centroid'])}"
+                )
+                hud_colors.append((0,0,255) if o.get("rank", 999) == 1 else (255,255,255))
         else:
             hud_lines.append("No balloons detected")
-
-        draw_hud_bottom_left(annotated, hud_lines)
+            hud_colors = [(255,255,255), (255,255,255)]
+        draw_hud_bottom_left(annotated, hud_lines, hud_colors)
 
         cv.imshow(WINDOW_NAME, annotated)
         if (cv.waitKey(1) & 0xFF) == ord('q'):
