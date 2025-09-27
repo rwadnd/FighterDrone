@@ -1,42 +1,44 @@
 import os
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"  # TEMP only
 
 import cv2 as cv
 from ultralytics import YOLO
 import torch, math, time
 from collections import deque
+import numpy as np
 
+# ====== Fast settings ======
+WIDTH, HEIGHT = 1280, 720           # downscale camera for speed
+IMGSZ = 640                          # detector input size
+BALLOON_ID = 1
+TRACKER_CFG = "bytetrack.yaml"       # ByteTrack = faster than BOT-SORT
+CONF_T, IOU_T = 0.5, 0.45
+MAX_DET = 3
 
-WIDTH, HEIGHT = 1920, 1080
 CENTER = (WIDTH // 2, HEIGHT // 2)
-
-TRACKER_CFG = "bytetrack.yaml"   # or "botsort.yaml"
-BALLOON_ID = 1                   
 
 K_HISTORY = 5
 V_MIN = 1.5
 AREA_T_POS = 400.0
 AREA_T_NEG = 400.0
-CENTER_MARGIN_X = 0.15
-CENTER_MARGIN_Y = 0.15
+CENTER_MARGIN_X = 0.10
+CENTER_MARGIN_Y = 0.10
 W_SIZE, W_CENTER, W_APPROACH, W_VEL = 0.45, 0.30, 0.20, 0.05
 EXPECTED_MAX_AHAT = 0.08
 
 FONT = cv.FONT_HERSHEY_SIMPLEX
 FONT_SCALE = 0.6
 FONT_THICK = 1
-LINE_SPACING = 20  # px between lines
+LINE_SPACING = 20
 PANEL_PAD_X = 10
 PANEL_PAD_Y = 10
-
 
 class TrackState:
     def __init__(self):
         self.centroids = deque(maxlen=K_HISTORY)
         self.areas = deque(maxlen=K_HISTORY)
 
-track_db = {}  # track_id -> TrackState
-
+track_db = {}
 
 def size_index_from_Ahat(Ahat: float) -> str:
     if Ahat < 0.01: return "Small"
@@ -61,7 +63,7 @@ def avg_velocity(centroids):
     return dx, dy
 
 def dir_label_from_v(vx, vy):
-    vy = -vy  # invert for display intuition
+    vy = -vy
     speed = math.hypot(vx, vy)
     if speed < V_MIN:
         return "Stationary"
@@ -92,14 +94,11 @@ def clip01(x): return max(0.0, min(1.0, x))
 def sigmoid(x): return 1.0 / (1.0 + math.exp(-x))
 
 def draw_translucent_panel(img, x, y, w, h, color=(0,0,0), alpha=0.4):
-    """Draw a translucent rectangle at (x,y) with size (w,h)."""
     overlay = img.copy()
     cv.rectangle(overlay, (x, y), (x + w, y + h), color, -1)
     cv.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
 
 def draw_hud_bottom_left(img, lines):
-    """Draws a multi-line HUD block in the bottom-left."""
-    # Measure panel width by the longest line
     max_text_w = 0
     text_h = 0
     for ln in lines:
@@ -108,21 +107,13 @@ def draw_hud_bottom_left(img, lines):
         text_h = max(text_h, th)
     panel_w = max_text_w + 2 * PANEL_PAD_X
     panel_h = PANEL_PAD_Y * 2 + len(lines) * LINE_SPACING
-
-    # Bottom-left corner
     x = 10
-    y = img.shape[0] - 10 - panel_h  # top-left y of the panel
-
-    # Panel
+    y = img.shape[0] - 10 - panel_h
     draw_translucent_panel(img, x, y, panel_w, panel_h, color=(0,0,0), alpha=0.45)
-
-    # Text lines
     baseline_y = y + PANEL_PAD_Y + text_h
     for ln in lines:
         cv.putText(img, ln, (x + PANEL_PAD_X, baseline_y), FONT, FONT_SCALE, (255,255,255), FONT_THICK, cv.LINE_AA)
         baseline_y += LINE_SPACING
-
-
 
 def detect():
     cv.namedWindow("YOLOv11 Detection", cv.WINDOW_NORMAL)
@@ -132,55 +123,72 @@ def detect():
     cap.set(cv.CAP_PROP_FRAME_WIDTH, WIDTH)
     cap.set(cv.CAP_PROP_FRAME_HEIGHT, HEIGHT)
     cap.set(cv.CAP_PROP_FPS, 30)
+    # Try MJPEG (often speeds up webcams on Windows)
+    try:
+        fourcc = cv.VideoWriter_fourcc(*'MJPG')
+        cap.set(cv.CAP_PROP_FOURCC, fourcc)
+    except Exception:
+        pass
 
     model = YOLO("lastv6.pt")
-    device = 0 if torch.cuda.is_available() else None
 
-    # FPS smoothing (EMA)
+    USE_GPU = torch.cuda.is_available()
+    device = 0 if USE_GPU else None
+    if USE_GPU:
+        torch.backends.cudnn.benchmark = True  # autotune convs
+        # explicitly move to GPU (ultralytics usually handles, but be explicit)
+        model.to('cuda')
+
     fps = 0.0
     alpha_fps = 0.1
     last_t = time.perf_counter()
 
     while True:
-        t0 = time.perf_counter()
+        loop_t0 = time.perf_counter()
         ret, frame = cap.read()
         if not ret:
             break
         frame = cv.flip(frame, 1)
 
+        # ---------- DETECT/TRACK ----------
+        t0 = time.perf_counter()
         results = model.track(
             frame,
             persist=True,
             tracker=TRACKER_CFG,
-            conf=0.5,
-            iou=0.45,
-            imgsz=960,
+            conf=CONF_T,
+            iou=IOU_T,
+            imgsz=IMGSZ,
             verbose=False,
             device=device,
             classes=[BALLOON_ID],
+            max_det=MAX_DET,
+            half=USE_GPU,           # use FP16 on GPU
         )
+        t1 = time.perf_counter()
 
         r0 = results[0]
-        annotated = r0.plot()
+        annotated = frame  # manual draws only (faster than r0.plot())
         cv.circle(annotated, CENTER, 3, (0, 255, 0), -1, cv.LINE_AA)
 
+        # ---------- POST/RENDER ----------
         boxes = r0.boxes
         outputs = []
         top_threat = None
 
         if boxes is not None and len(boxes) > 0:
-            xywh = boxes.xywh.detach().cpu().tolist()
-            conf = boxes.conf.detach().cpu().tolist()
-            ids  = boxes.id.detach().cpu().tolist() if boxes.id is not None else [None]*len(xywh)
+            xywh = boxes.xywh.detach().cpu().numpy()
+            conf = boxes.conf.detach().cpu().numpy()
+            ids  = boxes.id.detach().cpu().numpy() if boxes.id is not None else np.array([None]*len(xywh))
 
             for (x, y, w, h), s, tid in zip(xywh, conf, ids):
-                cx, cy = int(x), int(y)
-                A = w * h
-                Ahat = A / float(WIDTH * HEIGHT)
-
                 if tid is None:
                     continue
                 tid = int(tid)
+                cx, cy = int(x), int(y)
+                A = float(w) * float(h)
+                Ahat = A / float(WIDTH * HEIGHT)
+
                 st = track_db.get(tid)
                 if st is None:
                     st = TrackState()
@@ -220,27 +228,25 @@ def detect():
                     "threat_score": round(threat, 3)
                 })
 
-                # Draw centroid + quick label
-                cv.circle(annotated, (cx, cy), 3, (0, 255, 255), -1, cv.LINE_AA)
-                cv.putText(annotated, f"ID {tid} | {size_idx}", (cx + 8, cy - 8),
-                           FONT, 0.6, (50, 255, 255), 2, cv.LINE_AA)
+                # Minimal drawing (faster than plot):
+                x1, y1 = int(x - w/2), int(y - h/2)
+                x2, y2 = int(x + w/2), int(y + h/2)
+                cv.rectangle(annotated, (x1, y1), (x2, y2), (0,255,255), 2, cv.LINE_AA)
+                cv.putText(annotated, f"ID {tid} {size_idx}", (x1, max(20, y1-6)),
+                           FONT, 0.6, (0,255,255), 2, cv.LINE_AA)
 
             if outputs:
                 top_threat = max(outputs, key=lambda o: o["threat_score"])
-                cx, cy = top_threat["centroid"]
-                ver = "top" if cy <= CENTER[1] else "bottom"
-                hor = "left" if cx <= CENTER[0] else "right"
-                cv.putText(annotated, f"Center is: {ver} {hor}",
-                           (10, 30), FONT, 1, (0, 255, 0), 2, cv.LINE_AA)
+  
 
-
-        # Update FPS (EMA)
-        t1 = time.perf_counter()
-        inst_fps = 1.0 / max(1e-6, (t1 - last_t))
-        last_t = t1
+        # ---------- FPS / HUD ----------
+        t2 = time.perf_counter()
+        inst_fps = 1.0 / max(1e-6, (t2 - last_t))
+        last_t = t2
         fps = (1 - alpha_fps) * fps + alpha_fps * inst_fps if fps > 0 else inst_fps
 
-        hud_lines = [f"FPS: {fps:5.1f}"]
+        hud_lines = [f"FPS: {fps:5.1f}",
+                     f"Times ms  det+track={(t1-t0)*1000:5.1f}  post={(t2-t1)*1000:5.1f}  loop={(t2-loop_t0)*1000:5.1f}"]
         if outputs:
             for o in outputs:
                 hud_lines.append(f"ID {o['id']} | {o['position_label']} | C{tuple(o['centroid'])}")
@@ -255,14 +261,12 @@ def detect():
 
         draw_hud_bottom_left(annotated, hud_lines)
 
-        # Display
         cv.imshow("YOLOv11 Detection", annotated)
         if (cv.waitKey(1) & 0xFF) == ord("q"):
             break
 
     cap.release()
     cv.destroyAllWindows()
-
 
 if __name__ == "__main__":
     detect()
