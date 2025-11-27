@@ -1,0 +1,96 @@
+<!doctype html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <title>WebSocket CV Stream</title>
+    <style>
+        body { font-family: Arial, sans-serif; display:flex; gap:16px; padding:16px; }
+        canvas { background: #000; }
+        #stats { width:220px; }
+        .metric { margin-bottom:8px; }
+    </style>
+</head>
+<body>
+    <div>
+        <canvas id="cv" width="640" height="360"></canvas>
+    </div>
+    <div id="stats">
+        <div class="metric">FPS (server): <span id="fps">-</span></div>
+        <div class="metric">Latency (ms): <span id="lat">-</span></div>
+        <div class="metric">Bytes/frame: <span id="size">-</span></div>
+        <div class="metric">Status: <span id="status">connecting...</span></div>
+        <div class="metric">Please wait 20 seconds for the fps to get stable</div>
+    </div>
+
+<script>
+(async () => {
+  const ws = new WebSocket("ws://localhost:8765");
+  ws.binaryType = "arraybuffer";
+
+  const canvas = document.getElementById("cv");
+  const ctx = canvas.getContext("2d");
+
+  const fpsEl = document.getElementById("fps");
+  const latEl = document.getElementById("lat");
+  const sizeEl = document.getElementById("size");
+  const statusEl = document.getElementById("status");
+
+  ws.onopen = () => statusEl.textContent = "connected";
+  ws.onclose = () => statusEl.textContent = "disconnected";
+  ws.onerror = () => statusEl.textContent = "error";
+
+  ws.onmessage = async (evt) => {
+    const arr = evt.data;
+    const view = new DataView(arr);
+
+    // ---- READ TIMESTAMP (correct: only 8 bytes) ----
+    const server_ts_ms = view.getFloat64(0, true);
+
+    // ---- JPEG BYTES START AT BYTE 8 ----
+    const jpeg_bytes = arr.slice(8);
+    sizeEl.textContent = jpeg_bytes.byteLength;
+
+    // ---- DECODE JPEG ----
+    try {
+      const bitmap = await createImageBitmap(
+        new Blob([jpeg_bytes], { type: "image/jpeg" })
+      );
+
+      ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+      bitmap.close();
+
+      // ---- LATENCY ----
+      const latency_ms = Date.now() - server_ts_ms;
+      latEl.textContent = latency_ms.toFixed(0);
+
+      // ---- CLIENT SIDE FPS ----
+      // (client FPS = render FPS)
+      updateFPS();
+
+    } catch (e) {
+      console.error("Image decode error:", e);
+    }
+  };
+
+  // ---- SIMPLE CLIENT FPS METER ----
+  let last = performance.now();
+  let fpsList = [];
+
+  function updateFPS() {
+    const now = performance.now();
+    const delta = now - last;
+    last = now;
+
+    const fps = 1000 / delta;
+    fpsList.push(fps);
+    if (fpsList.length > 30) fpsList.shift();
+
+    const avg = fpsList.reduce((a,b)=>a+b,0) / fpsList.length;
+    fpsEl.textContent = avg.toFixed(1);
+  }
+
+})();
+</script>
+
+</body>
+</html>
