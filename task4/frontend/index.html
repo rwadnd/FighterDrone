@@ -3,24 +3,28 @@
 <head>
     <meta charset="utf-8" />
     <title>WebSocket CV Stream</title>
-    <style>
-        body { font-family: Arial, sans-serif; display:flex; gap:16px; padding:16px; }
-        canvas { background: #000; }
-        #stats { width:220px; }
-        .metric { margin-bottom:8px; }
-    </style>
+   <style>
+    body { font-family: Arial, sans-serif; display:flex; gap:16px; padding:16px; }
+    #container { display:flex; gap:16px; align-items:flex-start; }
+    canvas { background: #000; border-radius:6px; }
+    #stats { width:240px; }
+    .metric { margin-bottom:8px; }
+    .label { color:#aaa; font-size:12px; }
+    .value { font-weight:600; }
+  </style>
 </head>
 <body>
-    <div>
-        <canvas id="cv" width="640" height="360"></canvas>
-    </div>
+  <div id="container">
+    <canvas id="cv" width="640" height="360"></canvas>
+
     <div id="stats">
-        <div class="metric">FPS (server): <span id="fps">-</span></div>
-        <div class="metric">Latency (ms): <span id="lat">-</span></div>
-        <div class="metric">Bytes/frame: <span id="size">-</span></div>
-        <div class="metric">Status: <span id="status">connecting...</span></div>
-        <div class="metric">Please wait 20 seconds for the fps to get stable</div>
+      <div class="metric"><div class="label">Server FPS:</div> <div class="value" id="fps">-</div></div>
+      <div class="metric"><div class="label">Latency (ms):</div> <div class="value" id="lat">-</div></div>
+      <div class="metric"><div class="label">Bytes/frame:</div> <div class="value" id="size">-</div></div>
+      <div class="metric"><div class="label">Status:</div> <div class="value" id="status">connecting...</div></div>
+      <div class="metric"><div style="color: red;" class="label">Please wait 20 seconds for the fps to get stable</div>
     </div>
+  </div>
 
 <script>
 (async () => {
