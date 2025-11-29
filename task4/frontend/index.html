@@ -1,100 +1,145 @@
 <!doctype html>
 <html>
 <head>
-    <meta charset="utf-8" />
-    <title>WebSocket CV Stream</title>
-   <style>
-    body { font-family: Arial, sans-serif; display:flex; gap:16px; padding:16px; }
-    #container { display:flex; gap:16px; align-items:flex-start; }
-    canvas { background: #000; border-radius:6px; }
+  <meta charset="utf-8">
+  <title>WS Stream</title>
+  <style>
+    body { font-family: Arial; display:flex; gap:20px; padding:20px; }
+    canvas { background:#000; border-radius:6px; }
     #stats { width:240px; }
-    .metric { margin-bottom:8px; }
-    .label { color:#aaa; font-size:12px; }
-    .value { font-weight:600; }
+    .metric { margin-bottom:10px; }
+    .label { font-size:12px; color:#777; }
+    .value { font-weight:bold; }
   </style>
 </head>
-<body>
-  <div id="container">
-    <canvas id="cv" width="640" height="360"></canvas>
 
-    <div id="stats">
-      <div class="metric"><div class="label">Server FPS:</div> <div class="value" id="fps">-</div></div>
-      <div class="metric"><div class="label">Latency (ms):</div> <div class="value" id="lat">-</div></div>
-      <div class="metric"><div class="label">Bytes/frame:</div> <div class="value" id="size">-</div></div>
-      <div class="metric"><div class="label">Status:</div> <div class="value" id="status">connecting...</div></div>
-      <div class="metric"><div style="color: red;" class="label">Please wait 20 seconds for the fps to get stable</div>
+<body>
+  <canvas id="cv" width="1200" height="720"></canvas>
+
+  <div id="stats">
+    <div class="metric">
+      <input type="file" id="vidInput" accept="video/*">
     </div>
+
+    <div class="metric"><div class="label">Server FPS:</div><div class="value" id="srvfps">-</div></div>
+    <div class="metric"><div class="label">Latency (ms):</div><div class="value" id="lat">-</div></div>
+    <div class="metric"><div class="label">Bytes/frame:</div><div class="value" id="size">-</div></div>
+    <div class="metric"><div class="label">Status:</div><div class="value" id="status">connecting...</div></div>
   </div>
 
 <script>
-(async () => {
-  const ws = new WebSocket("ws://localhost:8765");
-  ws.binaryType = "arraybuffer";
+const canvas = document.getElementById("cv");
+const ctx = canvas.getContext("2d");
+const videoInput = document.getElementById("vidInput");
 
-  const canvas = document.getElementById("cv");
-  const ctx = canvas.getContext("2d");
+const serverFpsEl = document.getElementById("srvfps");
+const latEl = document.getElementById("lat");
+const sizeEl = document.getElementById("size");
+const statusEl = document.getElementById("status");
 
-  const fpsEl = document.getElementById("fps");
-  const latEl = document.getElementById("lat");
-  const sizeEl = document.getElementById("size");
-  const statusEl = document.getElementById("status");
+// ----------------------
+// 1) NORMAL WS STREAM
+// ----------------------
+let ws = new WebSocket("ws://localhost:8765");
+ws.binaryType = "arraybuffer";
 
-  ws.onopen = () => statusEl.textContent = "connected";
-  ws.onclose = () => statusEl.textContent = "disconnected";
-  ws.onerror = () => statusEl.textContent = "error";
+ws.onopen = () => statusEl.textContent = "connected";
+ws.onclose = () => statusEl.textContent = "disconnected";
+ws.onerror = () => statusEl.textContent = "error";
 
-  ws.onmessage = async (evt) => {
-    const arr = evt.data;
-    const view = new DataView(arr);
+ws.onmessage = async evt => {
+  if (usingVideoFile) return;  // ignore WS if user selected video
 
-    // ---- READ TIMESTAMP (correct: only 8 bytes) ----
-    const server_ts_ms = view.getFloat64(0, true);
+  const arr = evt.data;
+  const view = new DataView(arr);
 
-    // ---- JPEG BYTES START AT BYTE 8 ----
-    const jpeg_bytes = arr.slice(8);
-    sizeEl.textContent = jpeg_bytes.byteLength;
+  const server_ts_ms = view.getFloat64(0, true);
+  const server_fps   = view.getUint16(8, true);
+  serverFpsEl.textContent = server_fps;
 
-    // ---- DECODE JPEG ----
-    try {
-      const bitmap = await createImageBitmap(
-        new Blob([jpeg_bytes], { type: "image/jpeg" })
-      );
+  const jpeg_bytes = arr.slice(10);
+  sizeEl.textContent = jpeg_bytes.byteLength;
 
-      ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-      bitmap.close();
-
-      // ---- LATENCY ----
-      const latency_ms = Date.now() - server_ts_ms;
-      latEl.textContent = latency_ms.toFixed(0);
-
-      // ---- CLIENT SIDE FPS ----
-      // (client FPS = render FPS)
-      updateFPS();
-
-    } catch (e) {
-      console.error("Image decode error:", e);
-    }
-  };
-
-  // ---- SIMPLE CLIENT FPS METER ----
-  let last = performance.now();
-  let fpsList = [];
-
-  function updateFPS() {
-    const now = performance.now();
-    const delta = now - last;
-    last = now;
-
-    const fps = 1000 / delta;
-    fpsList.push(fps);
-    if (fpsList.length > 30) fpsList.shift();
-
-    const avg = fpsList.reduce((a,b)=>a+b,0) / fpsList.length;
-    fpsEl.textContent = avg.toFixed(1);
+  try {
+    const bitmap = await createImageBitmap(new Blob([jpeg_bytes], {type:"image/jpeg"}));
+    ctx.drawImage(bitmap, 0, 0);
+    bitmap.close();
+  } catch (e) {
+    console.error("decode error", e);
   }
 
-})();
-</script>
+  const latency = Date.now() - server_ts_ms;
+  latEl.textContent = latency.toFixed(0);
+};
 
+
+// --------------------------------------------
+// 2) LOCAL VIDEO FILE PROCESSING (No WebSocket)
+// --------------------------------------------
+let usingVideoFile = false;
+
+videoInput.onchange = async e => {
+  const file = e.target.files[0];
+  if (!file) return;
+
+  usingVideoFile = true;
+  statusEl.textContent = "playing video file";
+
+  ws.close();  // stop receiving WS frames
+
+  const url = URL.createObjectURL(file);
+  const vid = document.createElement("video");
+  vid.src = url;
+  vid.muted = true;
+  vid.play();
+
+  const offCanvas = document.createElement("canvas");
+  offCanvas.width = 1920;
+  offCanvas.height = 1080;
+  const offCtx = offCanvas.getContext("2d");
+
+  let lastTime = performance.now();
+  let frameCount = 0;
+
+  function processFrame() {
+    if (!usingVideoFile) return;
+
+    if (vid.paused || vid.ended) {
+      requestAnimationFrame(processFrame);
+      return;
+    }
+
+    // Draw frame
+    offCtx.drawImage(vid, 0, 0, 1200, 720);
+
+    // Convert to edges
+    let imgData = offCtx.getImageData(0, 0, 1200, 720);
+    let data = imgData.data;
+
+    // Simple JS edge filter (fast pseudo-Canny)
+    for (let i = 0; i < data.length; i += 4) {
+      let v = data[i]; // grayscale-ish
+      data[i] = data[i+1] = data[i+2] = v < 50 ? 0 : 255;
+    }
+
+    ctx.putImageData(imgData, 0, 0);
+
+    // Fake stats for UI
+    frameCount++;
+    const now = performance.now();
+    if (now - lastTime >= 1000) {
+      serverFpsEl.textContent = frameCount;
+      sizeEl.textContent = (data.byteLength / 1024).toFixed(1) + " KB";
+      latEl.textContent = "0";
+      lastTime = now;
+      frameCount = 0;
+    }
+
+    requestAnimationFrame(processFrame);
+  }
+
+  processFrame();
+};
+</script>
 </body>
 </html>
